@@ -38,7 +38,9 @@ requiring repeated trial and error in Home Assistant.
 - Checks the common Tuya TCP ports `6668`, `6669`, and `8681`.
 - Performs Tuya LAN discovery.
 - Tests protocol versions 3.1, 3.2, 3.3, 3.4, and 3.5.
-- Tests standard, `device22`, and alternative Tuya 3.5 status-query behavior.
+- Tests standard, `device22`, and multiple alternative Tuya 3.5 status-query
+  behaviors.
+- Requests explicit DP updates and listens for the resulting device report.
 - Runs read-only heartbeat, status, product, and DP-detection requests.
 - Queries common and extended datapoints.
 - Records response times and exact exception types.
@@ -58,15 +60,19 @@ requiring repeated trial and error in Home Assistant.
 | `3.42` | 3.4 | `device22` |
 | `3.5` | 3.5 | standard |
 | `3.5-data-dps` | 3.5 | `{"data":{"dps":{}}}` payload |
+| `3.5-explicit-dps` | 3.5 | identity, timestamp, and explicit null DP map |
+| `3.5-protocol-dps` | 3.5 | protocol wrapper and explicit null DP map |
+| `3.5-updatedps` | 3.5 | `UPDATEDPS` request followed by passive receive |
 | `3.52` | 3.5 | `device22` |
 
-`3.22`, `3.42`, `3.5-data-dps`, and `3.52` are analyzer labels for
-alternative status queries. They are not official Tuya wire-protocol version
-numbers.
+Selectors containing a suffix are analyzer labels for alternative status
+queries. They are not official Tuya wire-protocol version numbers.
 
 Some protocol-3.5 devices reject the normal empty status payload `{}` with
 `json obj data unvalid`. The `3.5-data-dps` probe tests the known read-only
-alternative `{"data":{"dps":{}}}` on a fresh connection.
+alternative `{"data":{"dps":{}}}` on a fresh connection. The other 3.5
+probes request the known same information using explicit DP maps or an
+`UPDATEDPS` report request. They do not assign or change DP values.
 
 ## Safety and privacy
 
@@ -238,6 +244,8 @@ Typical meanings:
 | Standard variant returns DPs | Use that protocol with the normal status query |
 | Only `device22` returns DPs | Integration needs the alternative status query |
 | Only `3.5-data-dps` returns DPs | Integration needs the alternative 3.5 query payload |
+| Only a 3.5 explicit-DP variant returns DPs | Integration must include DP identifiers in its query |
+| Only `3.5-updatedps` returns DPs | Integration must request and receive an active DP report |
 | Only 3.5 returns DPs | Integration needs genuine 3.5/6699/AES-GCM support |
 
 Manually entering DP numbers cannot fix an incompatible wire protocol. DP

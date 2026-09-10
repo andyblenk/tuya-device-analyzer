@@ -24,6 +24,7 @@ import tinytuya
 TUYA_PORTS = (6668, 6669, 8681)
 CORE_DPS = (1, 2, 3, 4, 5, 6, 21, 23)
 EXTENDED_DPS = (1, 101, 102, 103, 104, 105, 106, 107, 108, 109)
+QUERY_DPS = tuple(sorted(set(CORE_DPS + EXTENDED_DPS + tuple(range(7, 15)))))
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,9 @@ PROTOCOL_VARIANTS = (
     ProtocolVariant("3.42", 3.4, "device22"),
     ProtocolVariant("3.5", 3.5, "default"),
     ProtocolVariant("3.5-data-dps", 3.5, "default", "data_dps"),
+    ProtocolVariant("3.5-explicit-dps", 3.5, "default", "explicit_dps"),
+    ProtocolVariant("3.5-protocol-dps", 3.5, "default", "protocol_dps"),
+    ProtocolVariant("3.5-updatedps", 3.5, "default", "updatedps"),
     ProtocolVariant("3.52", 3.5, "device22"),
 )
 
@@ -272,23 +276,41 @@ def create_device(
     return device
 
 
-def status_with_query_mode(device: Any, variant: ProtocolVariant) -> Any:
+def status_with_query_mode(
+    device: Any,
+    variant: ProtocolVariant,
+    dps: tuple[int, ...] = QUERY_DPS,
+) -> Any:
     """Read device status using the query payload selected by the variant."""
     if variant.query_mode == "standard":
         return device.status()
 
-    if variant.query_mode != "data_dps":
-        raise ValueError(f"Unsupported query mode: {variant.query_mode}")
-
-    # Some protocol 3.5 devices reject TinyTuya's default empty payload and
-    # require {"data":{"dps":{}}}. Adjust only this device instance's payload
-    # definition for the single, read-only status call.
     from tinytuya.core import command_types
 
+    if variant.query_mode == "data_dps":
+        query_command = {"data": {"dps": {}}}
+    elif variant.query_mode == "explicit_dps":
+        query_command = {
+            "devId": "",
+            "uid": "",
+            "t": "",
+            "dps": {str(dp): None for dp in dps},
+        }
+    elif variant.query_mode == "protocol_dps":
+        query_command = {
+            "protocol": 5,
+            "t": "int",
+            "data": {"dps": {str(dp): None for dp in dps}},
+        }
+    else:
+        raise ValueError(f"Unsupported query mode: {variant.query_mode}")
+
+    # Adjust only this device instance's payload definition for the single,
+    # read-only status call.
     device.generate_payload(command_types.DP_QUERY)
     query_config = device.payload_dict[command_types.DP_QUERY]
     original_command = query_config.get("command")
-    query_config["command"] = {"data": {"dps": {}}}
+    query_config["command"] = query_command
     try:
         return device.status()
     finally:
@@ -296,6 +318,24 @@ def status_with_query_mode(device: Any, variant: ProtocolVariant) -> Any:
             query_config.pop("command", None)
         else:
             query_config["command"] = original_command
+
+
+def request_updated_dps(
+    device: Any,
+    dps: tuple[int, ...] = QUERY_DPS,
+) -> dict[str, Any]:
+    """Ask the device to report selected DPs and collect its next message."""
+    send_result = device.updatedps(index=list(dps), nowait=True)
+    response = device.receive()
+    result: dict[str, Any] = {
+        "requested_dps": list(dps),
+        "send_result": send_result,
+        "received": response,
+    }
+    received_dps = response_dps(response)
+    if received_dps:
+        result["dps"] = received_dps
+    return result
 
 
 def probe_variant(
@@ -334,10 +374,22 @@ def probe_variant(
         )
         time.sleep(1.5)
 
-        if variant.query_mode == "data_dps":
-            result["operations"]["status_data_dps"] = timed_call(
-                'status with payload {"data":{"dps":{}}}',
+        if variant.query_mode in {
+            "data_dps",
+            "explicit_dps",
+            "protocol_dps",
+        }:
+            operation_name = f"status_{variant.query_mode}"
+            result["operations"][operation_name] = timed_call(
+                f"status query mode {variant.query_mode}",
                 lambda: status_with_query_mode(device, variant),
+                reporter,
+                redactor,
+            )
+        elif variant.query_mode == "updatedps":
+            result["operations"]["updatedps"] = timed_call(
+                f"UPDATEDPS request {','.join(map(str, QUERY_DPS))}",
+                lambda: request_updated_dps(device),
                 reporter,
                 redactor,
             )
