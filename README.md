@@ -40,7 +40,9 @@ requiring repeated trial and error in Home Assistant.
 - Tests protocol versions 3.1, 3.2, 3.3, 3.4, and 3.5.
 - Tests standard, `device22`, and multiple alternative Tuya 3.5 status-query
   behaviors.
-- Requests explicit DP updates and listens for the resulting device report.
+- Accepts a device-specific DP list without embedding product-specific logic.
+- Tests DPs as a batch and in configurable chunks.
+- Requests explicit DP updates and listens for active device reports.
 - Runs read-only heartbeat, status, product, and DP-detection requests.
 - Queries common and extended datapoints.
 - Records response times and exact exception types.
@@ -61,8 +63,12 @@ requiring repeated trial and error in Home Assistant.
 | `3.5` | 3.5 | standard |
 | `3.5-data-dps` | 3.5 | `{"data":{"dps":{}}}` payload |
 | `3.5-explicit-dps` | 3.5 | identity, timestamp, and explicit null DP map |
+| `3.5-explicit-chunks` | 3.5 | explicit null DP map in small groups |
 | `3.5-protocol-dps` | 3.5 | protocol wrapper and explicit null DP map |
+| `3.5-dpid-list` | 3.5 | explicit `dpId` list |
 | `3.5-updatedps` | 3.5 | `UPDATEDPS` request followed by passive receive |
+| `3.5-updatedps-chunks` | 3.5 | chunked `UPDATEDPS` requests and receives |
+| `3.5-passive` | 3.5 | bounded observation of unsolicited reports |
 | `3.52` | 3.5 | `device22` |
 
 Selectors containing a suffix are analyzer labels for alternative status
@@ -73,6 +79,13 @@ Some protocol-3.5 devices reject the normal empty status payload `{}` with
 alternative `{"data":{"dps":{}}}` on a fresh connection. The other 3.5
 probes request the known same information using explicit DP maps or an
 `UPDATEDPS` report request. They do not assign or change DP values.
+
+The analyzer remains device-independent. Use `--dps` to supply IDs obtained
+from the Tuya data model, another integration, or a previous diagnostic run.
+Chunked probes can identify firmware that rejects a request when it contains
+an unsupported DP. During `3.5-passive`, operate the device physically when
+the console asks you to do so. This can reveal devices that report DPs only
+when their state changes.
 
 ## Safety and privacy
 
@@ -168,6 +181,9 @@ unset TUYA_LOCAL_KEY
 --timeout SECONDS      Timeout per network operation (default: 7)
 --pause SECONDS        Pause between protocol variants (default: 3)
 --output-dir PATH      Report directory (default: ./logs)
+--dps IDS              Comma-separated DP IDs for targeted probes
+--dp-chunk-size COUNT  Number of DPs per chunk (default: 5)
+--listen-seconds TIME  Passive 3.5 observation time (default: 30)
 -h, --help             Display the complete command reference
 ```
 
@@ -177,9 +193,15 @@ For example, to allow a slower device more time:
 python tuya_device_analyzer.py \
   --ip <DEVICE_IP> \
   --device-id <DEVICE_ID> \
+  --dps 1,2,3,9,10,11,12,13,14,101 \
+  --dp-chunk-size 1 \
+  --listen-seconds 45 \
   --timeout 10 \
   --pause 4
 ```
+
+The example DP list is illustrative. Replace it with the data points of the
+device being analyzed.
 
 ## Preparing a reliable test
 
@@ -221,6 +243,7 @@ The most useful JSON fields are:
 |---|---|
 | `target` | Redacted target metadata and identifier lengths |
 | `environment` | Python platform and TinyTuya version |
+| `probe_settings` | DP list, chunk size, and passive observation duration |
 | `tcp_ports` | Reachability of each tested Tuya port |
 | `discovery` | Tuya LAN discovery result |
 | `probes` | Result of every protocol and query-mode combination |
@@ -246,6 +269,8 @@ Typical meanings:
 | Only `3.5-data-dps` returns DPs | Integration needs the alternative 3.5 query payload |
 | Only a 3.5 explicit-DP variant returns DPs | Integration must include DP identifiers in its query |
 | Only `3.5-updatedps` returns DPs | Integration must request and receive an active DP report |
+| Only a chunked variant returns DPs | At least one DP in the larger request is rejected by the device |
+| Only `3.5-passive` returns DPs | Device likely reports locally only after state changes |
 | Only 3.5 returns DPs | Integration needs genuine 3.5/6699/AES-GCM support |
 
 Manually entering DP numbers cannot fix an incompatible wire protocol. DP

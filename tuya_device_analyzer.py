@@ -24,7 +24,9 @@ import tinytuya
 TUYA_PORTS = (6668, 6669, 8681)
 CORE_DPS = (1, 2, 3, 4, 5, 6, 21, 23)
 EXTENDED_DPS = (1, 101, 102, 103, 104, 105, 106, 107, 108, 109)
-QUERY_DPS = tuple(sorted(set(CORE_DPS + EXTENDED_DPS + tuple(range(7, 15)))))
+DEFAULT_QUERY_DPS = tuple(
+    sorted(set(CORE_DPS + EXTENDED_DPS + tuple(range(7, 15))))
+)
 
 
 @dataclass(frozen=True)
@@ -47,8 +49,12 @@ PROTOCOL_VARIANTS = (
     ProtocolVariant("3.5", 3.5, "default"),
     ProtocolVariant("3.5-data-dps", 3.5, "default", "data_dps"),
     ProtocolVariant("3.5-explicit-dps", 3.5, "default", "explicit_dps"),
+    ProtocolVariant("3.5-explicit-chunks", 3.5, "default", "explicit_chunks"),
     ProtocolVariant("3.5-protocol-dps", 3.5, "default", "protocol_dps"),
+    ProtocolVariant("3.5-dpid-list", 3.5, "default", "dpid_list"),
     ProtocolVariant("3.5-updatedps", 3.5, "default", "updatedps"),
+    ProtocolVariant("3.5-updatedps-chunks", 3.5, "default", "updatedps_chunks"),
+    ProtocolVariant("3.5-passive", 3.5, "default", "passive"),
     ProtocolVariant("3.52", 3.5, "device22"),
 )
 
@@ -154,6 +160,34 @@ def enable_tinytuya_debug(reporter: Reporter) -> logging.Logger:
     return logger
 
 
+def parse_dps(value: str) -> tuple[int, ...]:
+    """Parse a comma-separated, ordered set of Tuya DP IDs."""
+    try:
+        dps = tuple(dict.fromkeys(int(item.strip()) for item in value.split(",")))
+    except ValueError as exc:
+        message = "DPs must be comma-separated integers"
+        raise argparse.ArgumentTypeError(message) from exc
+    if not dps or any(dp < 1 or dp > 255 for dp in dps):
+        raise argparse.ArgumentTypeError("DP IDs must be between 1 and 255")
+    return dps
+
+
+def positive_float(value: str) -> float:
+    """Parse a positive floating-point command-line value."""
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
+
+
+def positive_int(value: str) -> int:
+    """Parse a positive integer command-line value."""
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Read-only protocol and DPS analyzer for Tuya LAN devices."
@@ -183,6 +217,25 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("logs"),
         help="Report directory (default: ./logs)",
+    )
+    parser.add_argument(
+        "--dps",
+        type=parse_dps,
+        default=DEFAULT_QUERY_DPS,
+        metavar="ID,ID,...",
+        help="Comma-separated DP IDs for targeted probes",
+    )
+    parser.add_argument(
+        "--dp-chunk-size",
+        type=positive_int,
+        default=5,
+        help="Number of DPs per targeted chunk request (default: 5)",
+    )
+    parser.add_argument(
+        "--listen-seconds",
+        type=positive_float,
+        default=30.0,
+        help="Passive observation time for Tuya 3.5 reports (default: 30)",
     )
     return parser.parse_args()
 
@@ -245,7 +298,13 @@ def response_dps(response: Any) -> dict[str, Any]:
     if not isinstance(response, dict):
         return {}
     dps = response.get("dps")
-    return dps if isinstance(dps, dict) else {}
+    if isinstance(dps, dict):
+        return dps
+    for key in ("data", "received", "response"):
+        nested_dps = response_dps(response.get(key))
+        if nested_dps:
+            return nested_dps
+    return {}
 
 
 def create_device(
@@ -279,7 +338,7 @@ def create_device(
 def status_with_query_mode(
     device: Any,
     variant: ProtocolVariant,
-    dps: tuple[int, ...] = QUERY_DPS,
+    dps: tuple[int, ...],
 ) -> Any:
     """Read device status using the query payload selected by the variant."""
     if variant.query_mode == "standard":
@@ -289,7 +348,7 @@ def status_with_query_mode(
 
     if variant.query_mode == "data_dps":
         query_command = {"data": {"dps": {}}}
-    elif variant.query_mode == "explicit_dps":
+    elif variant.query_mode in {"explicit_dps", "explicit_chunks"}:
         query_command = {
             "devId": "",
             "uid": "",
@@ -302,6 +361,8 @@ def status_with_query_mode(
             "t": "int",
             "data": {"dps": {str(dp): None for dp in dps}},
         }
+    elif variant.query_mode == "dpid_list":
+        query_command = {"dpId": list(dps)}
     else:
         raise ValueError(f"Unsupported query mode: {variant.query_mode}")
 
@@ -322,11 +383,17 @@ def status_with_query_mode(
 
 def request_updated_dps(
     device: Any,
-    dps: tuple[int, ...] = QUERY_DPS,
+    dps: tuple[int, ...],
+    wait_seconds: float,
 ) -> dict[str, Any]:
     """Ask the device to report selected DPs and collect its next message."""
-    send_result = device.updatedps(index=list(dps), nowait=True)
-    response = device.receive()
+    original_timeout = device.connection_timeout
+    device.set_socketTimeout(wait_seconds)
+    try:
+        send_result = device.updatedps(index=list(dps), nowait=True)
+        response = device.receive()
+    finally:
+        device.set_socketTimeout(original_timeout)
     result: dict[str, Any] = {
         "requested_dps": list(dps),
         "send_result": send_result,
@@ -336,6 +403,26 @@ def request_updated_dps(
     if received_dps:
         result["dps"] = received_dps
     return result
+
+
+def listen_for_report(device: Any, seconds: float) -> dict[str, Any]:
+    """Listen for one unsolicited device report for a bounded time."""
+    original_timeout = device.connection_timeout
+    device.set_socketTimeout(seconds)
+    try:
+        response = device.receive()
+    finally:
+        device.set_socketTimeout(original_timeout)
+    result: dict[str, Any] = {"listen_seconds": seconds, "received": response}
+    received_dps = response_dps(response)
+    if received_dps:
+        result["dps"] = received_dps
+    return result
+
+
+def dp_chunks(dps: tuple[int, ...], size: int) -> list[tuple[int, ...]]:
+    """Split DP IDs into deterministic query groups."""
+    return [dps[index : index + size] for index in range(0, len(dps), size)]
 
 
 def probe_variant(
@@ -378,18 +465,56 @@ def probe_variant(
             "data_dps",
             "explicit_dps",
             "protocol_dps",
+            "dpid_list",
         }:
             operation_name = f"status_{variant.query_mode}"
             result["operations"][operation_name] = timed_call(
                 f"status query mode {variant.query_mode}",
-                lambda: status_with_query_mode(device, variant),
+                lambda: status_with_query_mode(device, variant, args.dps),
                 reporter,
                 redactor,
             )
+        elif variant.query_mode == "explicit_chunks":
+            for group_index, dps_group in enumerate(
+                dp_chunks(args.dps, args.dp_chunk_size), start=1
+            ):
+                result["operations"][f"explicit_chunk_{group_index}"] = timed_call(
+                    f"Explicit status DP chunk {','.join(map(str, dps_group))}",
+                    lambda dps_group=dps_group: status_with_query_mode(
+                        device, variant, dps_group
+                    ),
+                    reporter,
+                    redactor,
+                )
+                time.sleep(0.5)
         elif variant.query_mode == "updatedps":
             result["operations"]["updatedps"] = timed_call(
-                f"UPDATEDPS request {','.join(map(str, QUERY_DPS))}",
-                lambda: request_updated_dps(device),
+                f"UPDATEDPS request {','.join(map(str, args.dps))}",
+                lambda: request_updated_dps(device, args.dps, args.timeout),
+                reporter,
+                redactor,
+            )
+        elif variant.query_mode == "updatedps_chunks":
+            for group_index, dps_group in enumerate(
+                dp_chunks(args.dps, args.dp_chunk_size), start=1
+            ):
+                result["operations"][f"updatedps_chunk_{group_index}"] = timed_call(
+                    f"UPDATEDPS chunk {','.join(map(str, dps_group))}",
+                    lambda dps_group=dps_group: request_updated_dps(
+                        device, dps_group, args.timeout
+                    ),
+                    reporter,
+                    redactor,
+                )
+                time.sleep(0.5)
+        elif variant.query_mode == "passive":
+            reporter.write(
+                "Passive observation started; operate the device physically now",
+                {"seconds": args.listen_seconds},
+            )
+            result["operations"]["passive_receive"] = timed_call(
+                "Passive DP report observation",
+                lambda: listen_for_report(device, args.listen_seconds),
                 reporter,
                 redactor,
             )
@@ -401,7 +526,7 @@ def probe_variant(
                 device.set_dpsUsed({str(dp): None for dp in dps_group})
                 result["operations"][group_name] = timed_call(
                     f"{group_name} DPS {','.join(map(str, dps_group))}",
-                    lambda: status_with_query_mode(device, variant),
+                    lambda: status_with_query_mode(device, variant, dps_group),
                     reporter,
                     redactor,
                 )
@@ -523,6 +648,11 @@ def main() -> int:
             "platform": sys.platform,
             "tinytuya": importlib.metadata.version("tinytuya"),
         },
+        "probe_settings": {
+            "dps": list(args.dps),
+            "dp_chunk_size": args.dp_chunk_size,
+            "listen_seconds": args.listen_seconds,
+        },
         "tcp_ports": {},
         "discovery": {},
         "probes": [],
@@ -531,6 +661,7 @@ def main() -> int:
     try:
         reporter.write("Analyzer started", report["target"])
         reporter.write("Environment", report["environment"])
+        reporter.write("Probe settings", report["probe_settings"])
 
         reachable_ports = []
         for port in TUYA_PORTS:
