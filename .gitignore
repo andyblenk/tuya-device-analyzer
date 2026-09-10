@@ -1,0 +1,29 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python caches and tooling
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Analyzer reports may contain sensitive device diagnostics
+logs/
+tuya-device-*.log
+tuya-device-*.json
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
