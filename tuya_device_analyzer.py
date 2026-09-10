@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only protocol and DPS analyzer for Tuya LAN devices."""
+"""Protocol and DPS analyzer for Tuya LAN devices."""
 
 from __future__ import annotations
 
@@ -188,9 +188,20 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def dp_id(value: str) -> int:
+    """Parse one Tuya DP ID."""
+    parsed = int(value)
+    if parsed < 1 or parsed > 255:
+        raise argparse.ArgumentTypeError("DP ID must be between 1 and 255")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Read-only protocol and DPS analyzer for Tuya LAN devices."
+        description=(
+            "Protocol and DPS analyzer for Tuya LAN devices. All standard "
+            "probes are read-only; state changes require explicit write-test options."
+        )
     )
     parser.add_argument("--ip", required=True, help="IP address of the device")
     parser.add_argument("--device-id", required=True, help="Tuya device ID")
@@ -237,7 +248,51 @@ def parse_args() -> argparse.Namespace:
         default=30.0,
         help="Passive observation time for Tuya 3.5 reports (default: 30)",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--write-switch-dp",
+        type=dp_id,
+        metavar="ID",
+        help="Switch DP to toggle during the optional write test",
+    )
+    parser.add_argument(
+        "--write-switch-current",
+        choices=("on", "off"),
+        help="Known current switch state; restored after the write test",
+    )
+    parser.add_argument(
+        "--write-protocol",
+        type=float,
+        choices=(3.1, 3.2, 3.3, 3.4, 3.5),
+        help="Protocol for the write test (default: version reported by discovery)",
+    )
+    parser.add_argument(
+        "--write-observe-seconds",
+        type=positive_float,
+        default=10.0,
+        help="Observation time after each write (default: 10)",
+    )
+    parser.add_argument(
+        "--allow-write",
+        action="store_true",
+        help="Explicitly permit the optional state-changing write test",
+    )
+    args = parser.parse_args()
+    write_options_used = any(
+        (
+            args.write_switch_dp is not None,
+            args.write_switch_current is not None,
+            args.write_protocol is not None,
+            args.allow_write,
+        )
+    )
+    if write_options_used:
+        if args.write_switch_dp is None:
+            parser.error("--write-switch-dp is required for a write test")
+        if args.write_switch_current is None:
+            parser.error("--write-switch-current is required for a write test")
+        if not args.allow_write:
+            parser.error("--allow-write is required for a write test")
+    return args
 
 
 def masked_device_id(device_id: str) -> str:
@@ -305,6 +360,14 @@ def response_dps(response: Any) -> dict[str, Any]:
         if nested_dps:
             return nested_dps
     return {}
+
+
+def merge_dps(target: dict[str, Any], source: dict[str, Any]) -> None:
+    """Merge DPs without replacing a known value with a null placeholder."""
+    for key, value in source.items():
+        key = str(key)
+        if value is not None or key not in target:
+            target[key] = value
 
 
 def create_device(
@@ -386,38 +449,52 @@ def request_updated_dps(
     dps: tuple[int, ...],
     wait_seconds: float,
 ) -> dict[str, Any]:
-    """Ask the device to report selected DPs and collect its next message."""
-    original_timeout = device.connection_timeout
-    device.set_socketTimeout(wait_seconds)
-    try:
-        send_result = device.updatedps(index=list(dps), nowait=True)
-        response = device.receive()
-    finally:
-        device.set_socketTimeout(original_timeout)
+    """Ask the device to report selected DPs and collect bounded responses."""
+    send_result = device.updatedps(index=list(dps), nowait=True)
+    observation = listen_for_reports(device, wait_seconds)
     result: dict[str, Any] = {
         "requested_dps": list(dps),
         "send_result": send_result,
-        "received": response,
+        "observation": observation,
     }
-    received_dps = response_dps(response)
+    received_dps = response_dps(observation)
     if received_dps:
         result["dps"] = received_dps
     return result
 
 
-def listen_for_report(device: Any, seconds: float) -> dict[str, Any]:
-    """Listen for one unsolicited device report for a bounded time."""
+def listen_for_reports(device: Any, seconds: float) -> dict[str, Any]:
+    """Collect unsolicited device reports for the complete bounded period."""
     original_timeout = device.connection_timeout
-    device.set_socketTimeout(seconds)
+    deadline = time.monotonic() + seconds
+    reports: list[dict[str, Any]] = []
+    combined_dps: dict[str, Any] = {}
     try:
-        response = device.receive()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            device.set_socketTimeout(min(1.0, remaining))
+            response = device.receive()
+            if response is None:
+                continue
+            report = {
+                "elapsed_seconds": round(seconds - max(remaining, 0), 3),
+                "response": response,
+            }
+            received_dps = response_dps(response)
+            if received_dps:
+                report["dps"] = received_dps
+                merge_dps(combined_dps, received_dps)
+            reports.append(report)
     finally:
         device.set_socketTimeout(original_timeout)
-    result: dict[str, Any] = {"listen_seconds": seconds, "received": response}
-    received_dps = response_dps(response)
-    if received_dps:
-        result["dps"] = received_dps
-    return result
+    return {
+        "listen_seconds": seconds,
+        "report_count": len(reports),
+        "reports": reports,
+        "dps": combined_dps,
+    }
 
 
 def dp_chunks(dps: tuple[int, ...], size: int) -> list[tuple[int, ...]]:
@@ -514,7 +591,7 @@ def probe_variant(
             )
             result["operations"]["passive_receive"] = timed_call(
                 "Passive DP report observation",
-                lambda: listen_for_report(device, args.listen_seconds),
+                lambda: listen_for_reports(device, args.listen_seconds),
                 reporter,
                 redactor,
             )
@@ -549,15 +626,15 @@ def probe_variant(
 
         all_dps: dict[str, Any] = {}
         for operation in result["operations"].values():
-            all_dps.update(response_dps(operation.get("response")))
+            merge_dps(all_dps, response_dps(operation.get("response")))
         detected_operation = result["operations"].get("detect_available_dps")
         if detected_operation:
             detected_response = detected_operation.get("response")
             if isinstance(detected_response, dict):
                 if "dps" in detected_response:
-                    all_dps.update(response_dps(detected_response))
+                    merge_dps(all_dps, response_dps(detected_response))
                 elif "Error" not in detected_response:
-                    all_dps.update(detected_response)
+                    merge_dps(all_dps, detected_response)
         result["combined_dps"] = all_dps
         result["dp_count"] = len(all_dps)
     except Exception as exc:
@@ -578,6 +655,150 @@ def probe_variant(
             "selector": variant.selector,
             "port": port,
             "dp_count": result.get("dp_count", 0),
+        },
+    )
+    return result
+
+
+def discovery_protocol(discovery: dict[str, Any]) -> float | None:
+    """Return a supported protocol version from a discovery result."""
+    response = discovery.get("response")
+    if not isinstance(response, dict):
+        return None
+    value = response.get("version")
+    try:
+        version = float(value)
+    except (TypeError, ValueError):
+        return None
+    return version if version in {3.1, 3.2, 3.3, 3.4, 3.5} else None
+
+
+def run_switch_write_test(
+    args: argparse.Namespace,
+    local_key: str,
+    port: int,
+    protocol: float,
+    reporter: Reporter,
+    redactor: Redactor,
+) -> dict[str, Any]:
+    """Toggle one Boolean DP, observe reports, and restore its known state."""
+    initial_state = args.write_switch_current == "on"
+    temporary_state = not initial_state
+    dev_type = "device22" if protocol == 3.2 else "default"
+    variant = ProtocolVariant("write-test", protocol, dev_type, "switch_write")
+    result: dict[str, Any] = {
+        "port": port,
+        "protocol": protocol,
+        "switch_dp": args.write_switch_dp,
+        "initial_state": initial_state,
+        "temporary_state": temporary_state,
+        "observe_seconds_per_phase": args.write_observe_seconds,
+        "operations": {},
+    }
+    reporter.write(
+        "WRITE TEST starting",
+        {
+            "protocol": protocol,
+            "switch_dp": args.write_switch_dp,
+            "temporary_state": temporary_state,
+            "restore_state": initial_state,
+        },
+    )
+
+    device = None
+    write_attempted = False
+    try:
+        device = create_device(
+            args.device_id,
+            args.ip,
+            local_key,
+            port,
+            variant,
+            args.timeout,
+        )
+        write_attempted = True
+        result["operations"]["temporary_write"] = timed_call(
+            f"WRITE TEST set DP {args.write_switch_dp} to {temporary_state}",
+            lambda: device.set_status(
+                temporary_state,
+                switch=args.write_switch_dp,
+                nowait=False,
+            ),
+            reporter,
+            redactor,
+        )
+        result["operations"]["observe_after_temporary_write"] = timed_call(
+            "WRITE TEST observe reports after temporary state",
+            lambda: listen_for_reports(device, args.write_observe_seconds),
+            reporter,
+            redactor,
+        )
+    except BaseException as exc:
+        result["setup_error"] = exception_result(exc, redactor)
+        reporter.write("WRITE TEST failed before restore", result["setup_error"])
+        if not isinstance(exc, Exception):
+            result["interrupted"] = True
+    finally:
+        if device is not None and write_attempted:
+            result["restore_attempted"] = True
+            result["operations"]["restore_write"] = timed_call(
+                f"WRITE TEST restore DP {args.write_switch_dp} to {initial_state}",
+                lambda: device.set_status(
+                    initial_state,
+                    switch=args.write_switch_dp,
+                    nowait=False,
+                ),
+                reporter,
+                redactor,
+            )
+            result["operations"]["observe_after_restore"] = timed_call(
+                "WRITE TEST observe reports after restore",
+                lambda: listen_for_reports(device, args.write_observe_seconds),
+                reporter,
+                redactor,
+            )
+        else:
+            result["restore_attempted"] = False
+        if device is not None:
+            try:
+                device.close()
+            except Exception as exc:
+                result["close_error"] = exception_result(exc, redactor)
+
+    combined_dps: dict[str, Any] = {}
+    for operation in result["operations"].values():
+        merge_dps(combined_dps, response_dps(operation.get("response")))
+    result["combined_dps"] = combined_dps
+
+    temporary_dps: dict[str, Any] = {}
+    restore_dps: dict[str, Any] = {}
+    for operation_name in ("temporary_write", "observe_after_temporary_write"):
+        operation = result["operations"].get(operation_name, {})
+        merge_dps(temporary_dps, response_dps(operation.get("response")))
+    for operation_name in ("restore_write", "observe_after_restore"):
+        operation = result["operations"].get(operation_name, {})
+        merge_dps(restore_dps, response_dps(operation.get("response")))
+    requested_dp_ids = {str(dp) for dp in args.dps}
+    result["analysis"] = {
+        "temporary_reported_dps": temporary_dps,
+        "temporary_missing_requested_dps": sorted(
+            requested_dp_ids - set(temporary_dps), key=int
+        ),
+        "temporary_reported_all_requested_dps": requested_dp_ids.issubset(
+            temporary_dps
+        ),
+        "restore_reported_dps": restore_dps,
+        "restore_missing_requested_dps": sorted(
+            requested_dp_ids - set(restore_dps), key=int
+        ),
+        "restore_reported_all_requested_dps": requested_dp_ids.issubset(restore_dps),
+    }
+    reporter.write(
+        "WRITE TEST finished",
+        {
+            "restore_attempted": result["restore_attempted"],
+            "combined_dps": combined_dps,
+            "analysis": result["analysis"],
         },
     )
     return result
@@ -636,7 +857,11 @@ def main() -> int:
     report: dict[str, Any] = {
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "tool": "tuya-device-analyzer",
-        "safety": "read-only; no state-changing DP commands",
+        "safety": (
+            "guarded switch write test enabled; original state restoration will be attempted"
+            if args.allow_write
+            else "read-only; no state-changing DP commands"
+        ),
         "target": {
             "ip": args.ip,
             "device_id_masked": masked_device_id(args.device_id),
@@ -652,10 +877,16 @@ def main() -> int:
             "dps": list(args.dps),
             "dp_chunk_size": args.dp_chunk_size,
             "listen_seconds": args.listen_seconds,
+            "write_test_enabled": args.allow_write,
+            "write_switch_dp": args.write_switch_dp,
+            "write_switch_current": args.write_switch_current,
+            "write_protocol": args.write_protocol,
+            "write_observe_seconds": args.write_observe_seconds,
         },
         "tcp_ports": {},
         "discovery": {},
         "probes": [],
+        "write_test": None,
     }
 
     try:
@@ -681,6 +912,28 @@ def main() -> int:
             )
             write_json_report(json_path, report, redactor)
             return 1
+
+        if args.allow_write:
+            protocol = args.write_protocol or discovery_protocol(report["discovery"])
+            if protocol is None:
+                report["write_test"] = {
+                    "skipped": True,
+                    "reason": (
+                        "Discovery did not return a supported protocol version; "
+                        "specify --write-protocol"
+                    ),
+                }
+                reporter.write("WRITE TEST skipped", report["write_test"])
+            else:
+                report["write_test"] = run_switch_write_test(
+                    args,
+                    local_key,
+                    reachable_ports[0],
+                    protocol,
+                    reporter,
+                    redactor,
+                )
+            write_json_report(json_path, report, redactor)
 
         time.sleep(args.pause)
         for port in reachable_ports:

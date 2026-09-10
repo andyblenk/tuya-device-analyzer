@@ -1,10 +1,13 @@
 # Tuya Device Analyzer
 
-**Tuya Device Analyzer** is a read-only command-line tool for diagnosing Tuya
-and Smart Life devices on the local network. It identifies the Tuya LAN
+**Tuya Device Analyzer** is a command-line tool for diagnosing Tuya and Smart
+Life devices on the local network. It identifies the Tuya LAN
 protocol and query mode a device actually supports, reads its available
 datapoints (DPs), and creates reports that help troubleshoot Home Assistant
 integrations such as LocalTuya.
+
+All normal probes are read-only. An optional, explicitly enabled switch test
+can verify state-changing commands and the reports emitted after a write.
 
 It is especially useful when a device is reachable but Home Assistant reports
 it as unavailable, or LocalTuya shows:
@@ -42,8 +45,11 @@ requiring repeated trial and error in Home Assistant.
   behaviors.
 - Accepts a device-specific DP list without embedding product-specific logic.
 - Tests DPs as a batch and in configurable chunks.
-- Requests explicit DP updates and listens for active device reports.
+- Requests explicit DP updates and collects active device reports for a bounded
+  period.
 - Runs read-only heartbeat, status, product, and DP-detection requests.
+- Optionally toggles one Boolean switch DP, records the response and subsequent
+  reports, and attempts to restore the supplied original state.
 - Queries common and extended datapoints.
 - Records response times and exact exception types.
 - Captures redacted TinyTuya protocol-level debug output.
@@ -89,9 +95,20 @@ when their state changes.
 
 ## Safety and privacy
 
-The analyzer is deliberately **read-only**. It never sends commands that
-switch a device, change a temperature, select a mode, or modify schedules,
-presets, or other device state.
+The analyzer is **read-only by default**. It does not change a DP unless the
+guarded switch test is explicitly configured and enabled.
+
+The optional switch test requires all of these arguments:
+
+- `--write-switch-dp`
+- `--write-switch-current`
+- `--allow-write`
+
+It temporarily sets the Boolean DP to the opposite value and then attempts to
+restore the state supplied with `--write-switch-current`. Restoration cannot
+be guaranteed if the process is killed, power or network connectivity is lost,
+or the device rejects the restoration command. Supervise the test and verify
+the final device state physically or in its official app.
 
 Use it only with devices you own or are authorized to administer.
 
@@ -184,6 +201,13 @@ unset TUYA_LOCAL_KEY
 --dps IDS              Comma-separated DP IDs for targeted probes
 --dp-chunk-size COUNT  Number of DPs per chunk (default: 5)
 --listen-seconds TIME  Passive 3.5 observation time (default: 30)
+--write-switch-dp ID   Boolean switch DP used for the guarded write test
+--write-switch-current {on,off}
+                       Known state to restore after the write test
+--write-protocol VER   Write protocol; otherwise use LAN discovery
+--write-observe-seconds TIME
+                       Observation time after each write (default: 10)
+--allow-write          Explicitly permit the state-changing write test
 -h, --help             Display the complete command reference
 ```
 
@@ -202,6 +226,29 @@ python tuya_device_analyzer.py \
 
 The example DP list is illustrative. Replace it with the data points of the
 device being analyzed.
+
+### Optional switch write test
+
+First confirm the current state of the device. This example declares that the
+configured switch DP is currently off. The analyzer will turn it on, observe
+all received messages, turn it off again, and perform a second observation:
+
+```bash
+python tuya_device_analyzer.py \
+  --ip <DEVICE_IP> \
+  --device-id <DEVICE_ID> \
+  --dps 1,2,3,9,10,11,12,13,14,101 \
+  --listen-seconds 45 \
+  --write-switch-dp 1 \
+  --write-switch-current off \
+  --write-protocol 3.5 \
+  --write-observe-seconds 15 \
+  --allow-write
+```
+
+Use `--write-switch-current on` if the device is currently on. The original
+state is always the value supplied on the command line; the analyzer does not
+guess it. Omitting every write option keeps the entire run read-only.
 
 ## Preparing a reliable test
 
@@ -248,6 +295,7 @@ The most useful JSON fields are:
 | `discovery` | Tuya LAN discovery result |
 | `probes` | Result of every protocol and query-mode combination |
 | `successful_variants` | Variants that returned one or more DPs |
+| `write_test` | Optional writes, replies, observed reports, and restore attempt |
 
 Interpret the report in this order:
 
@@ -323,6 +371,8 @@ is active. A second read-only run in another device state may reveal them.
 - It does not discover or extract a LocalKey.
 - It does not configure Home Assistant.
 - It does not guarantee that an integration supports the detected protocol.
+- Its optional switch test supports Boolean DPs only and cannot guarantee
+  restoration after an external interruption.
 - Behavior can differ between firmware versions of the same product.
 
 ## Related projects
