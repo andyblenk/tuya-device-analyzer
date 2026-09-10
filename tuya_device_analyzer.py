@@ -33,6 +33,7 @@ class ProtocolVariant:
     selector: str
     wire_version: float
     dev_type: str
+    query_mode: str = "standard"
 
 
 PROTOCOL_VARIANTS = (
@@ -43,6 +44,7 @@ PROTOCOL_VARIANTS = (
     ProtocolVariant("3.4", 3.4, "default"),
     ProtocolVariant("3.42", 3.4, "device22"),
     ProtocolVariant("3.5", 3.5, "default"),
+    ProtocolVariant("3.5-data-dps", 3.5, "default", "data_dps"),
     ProtocolVariant("3.52", 3.5, "device22"),
 )
 
@@ -270,6 +272,32 @@ def create_device(
     return device
 
 
+def status_with_query_mode(device: Any, variant: ProtocolVariant) -> Any:
+    """Read device status using the query payload selected by the variant."""
+    if variant.query_mode == "standard":
+        return device.status()
+
+    if variant.query_mode != "data_dps":
+        raise ValueError(f"Unsupported query mode: {variant.query_mode}")
+
+    # Some protocol 3.5 devices reject TinyTuya's default empty payload and
+    # require {"data":{"dps":{}}}. Adjust only this device instance's payload
+    # definition for the single, read-only status call.
+    from tinytuya.core import command_types
+
+    device.generate_payload(command_types.DP_QUERY)
+    query_config = device.payload_dict[command_types.DP_QUERY]
+    original_command = query_config.get("command")
+    query_config["command"] = {"data": {"dps": {}}}
+    try:
+        return device.status()
+    finally:
+        if original_command is None:
+            query_config.pop("command", None)
+        else:
+            query_config["command"] = original_command
+
+
 def probe_variant(
     args: argparse.Namespace,
     local_key: str,
@@ -306,45 +334,53 @@ def probe_variant(
         )
         time.sleep(1.5)
 
-        for group_name, dps_group in (
-            ("status_core", CORE_DPS),
-            ("status_extended", EXTENDED_DPS),
-        ):
-            device.set_dpsUsed({str(dp): None for dp in dps_group})
-            result["operations"][group_name] = timed_call(
-                f"{group_name} DPS {','.join(map(str, dps_group))}",
-                device.status,
+        if variant.query_mode == "data_dps":
+            result["operations"]["status_data_dps"] = timed_call(
+                'status with payload {"data":{"dps":{}}}',
+                lambda: status_with_query_mode(device, variant),
+                reporter,
+                redactor,
+            )
+        else:
+            for group_name, dps_group in (
+                ("status_core", CORE_DPS),
+                ("status_extended", EXTENDED_DPS),
+            ):
+                device.set_dpsUsed({str(dp): None for dp in dps_group})
+                result["operations"][group_name] = timed_call(
+                    f"{group_name} DPS {','.join(map(str, dps_group))}",
+                    lambda: status_with_query_mode(device, variant),
+                    reporter,
+                    redactor,
+                )
+                time.sleep(0.5)
+
+            result["operations"]["product"] = timed_call(
+                "product query",
+                device.product,
                 reporter,
                 redactor,
             )
             time.sleep(0.5)
 
-        result["operations"]["product"] = timed_call(
-            "product query",
-            device.product,
-            reporter,
-            redactor,
-        )
-        time.sleep(0.5)
-
-        result["operations"]["detect_available_dps"] = timed_call(
-            "DPS detection",
-            device.detect_available_dps,
-            reporter,
-            redactor,
-        )
+            result["operations"]["detect_available_dps"] = timed_call(
+                "DPS detection",
+                device.detect_available_dps,
+                reporter,
+                redactor,
+            )
 
         all_dps: dict[str, Any] = {}
         for operation in result["operations"].values():
             all_dps.update(response_dps(operation.get("response")))
-        detected_response = result["operations"]["detect_available_dps"].get(
-            "response"
-        )
-        if isinstance(detected_response, dict):
-            if "dps" in detected_response:
-                all_dps.update(response_dps(detected_response))
-            elif "Error" not in detected_response:
-                all_dps.update(detected_response)
+        detected_operation = result["operations"].get("detect_available_dps")
+        if detected_operation:
+            detected_response = detected_operation.get("response")
+            if isinstance(detected_response, dict):
+                if "dps" in detected_response:
+                    all_dps.update(response_dps(detected_response))
+                elif "Error" not in detected_response:
+                    all_dps.update(detected_response)
         result["combined_dps"] = all_dps
         result["dp_count"] = len(all_dps)
     except Exception as exc:

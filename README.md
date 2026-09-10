@@ -38,7 +38,7 @@ requiring repeated trial and error in Home Assistant.
 - Checks the common Tuya TCP ports `6668`, `6669`, and `8681`.
 - Performs Tuya LAN discovery.
 - Tests protocol versions 3.1, 3.2, 3.3, 3.4, and 3.5.
-- Tests standard and `device22` status-query behavior.
+- Tests standard, `device22`, and alternative Tuya 3.5 status-query behavior.
 - Runs read-only heartbeat, status, product, and DP-detection requests.
 - Queries common and extended datapoints.
 - Records response times and exact exception types.
@@ -57,10 +57,16 @@ requiring repeated trial and error in Home Assistant.
 | `3.4` | 3.4 | standard |
 | `3.42` | 3.4 | `device22` |
 | `3.5` | 3.5 | standard |
+| `3.5-data-dps` | 3.5 | `{"data":{"dps":{}}}` payload |
 | `3.52` | 3.5 | `device22` |
 
-`3.22`, `3.42`, and `3.52` are analyzer labels for alternative status queries.
-They are not official Tuya wire-protocol version numbers.
+`3.22`, `3.42`, `3.5-data-dps`, and `3.52` are analyzer labels for
+alternative status queries. They are not official Tuya wire-protocol version
+numbers.
+
+Some protocol-3.5 devices reject the normal empty status payload `{}` with
+`json obj data unvalid`. The `3.5-data-dps` probe tests the known read-only
+alternative `{"data":{"dps":{}}}` on a fresh connection.
 
 ## Safety and privacy
 
@@ -231,6 +237,7 @@ Typical meanings:
 | `Check device key or version` | LocalKey or protocol selection is incorrect |
 | Standard variant returns DPs | Use that protocol with the normal status query |
 | Only `device22` returns DPs | Integration needs the alternative status query |
+| Only `3.5-data-dps` returns DPs | Integration needs the alternative 3.5 query payload |
 | Only 3.5 returns DPs | Integration needs genuine 3.5/6699/AES-GCM support |
 
 Manually entering DP numbers cannot fix an incompatible wire protocol. DP
